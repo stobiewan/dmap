@@ -6,6 +6,7 @@ const { send, want, snapshot, revert, b32, fail} = require('minihat')
 const { expectEvent, check_gas} = require('./utils/helpers')
 const { bounds } = require('./bounds')
 const constants = ethers.constants
+const { smock } = require('@defi-wonderland/smock')
 
 const debug = require('debug')('dmap:test')
 
@@ -17,8 +18,10 @@ describe('dmap', ()=>{
     let ali, bob, cat
     let ALI, BOB, CAT
     const LOCK = '0x80'+'00'.repeat(31)
+    let signers
     before(async ()=>{
         [ali, bob, cat] = await ethers.getSigners();
+        signers = await ethers.getSigners();
         [ALI, BOB, CAT] = [ali, bob, cat].map(x => x.address)
 
         await hh.run('deploy-mock-dmap')
@@ -70,12 +73,101 @@ describe('dmap', ()=>{
         const data = '0x'+'22'.repeat(32)
         const rx = await send(dmap.set, name, meta, data)
 
+        const eventdata = meta + data.slice(2)
         expectEvent(
             rx, undefined,
-            [ethers.utils.hexZeroPad(ALI, 32).toLowerCase(), name, meta, data],
-            '0x'
+            [ethers.utils.hexZeroPad(ALI, 32).toLowerCase(), name, meta, data]
         )
+
         await check_entry(ALI, name, meta, data)
+    })
+
+    describe('event data no overlap', () => {
+        const keys = ['name', 'meta', 'data', 'zone']
+        for (let i = 0; i < keys.length; i++) {
+            let words = {}
+            words.name = words.meta = words.data = constants.HashZero
+            words.zone = constants.AddressZero
+            words[keys[i]] = '0x' + 'ff'.repeat(keys[i] == 'zone' ? 20 : 32)
+            it('set ' + keys[i], async () => {
+                const fake = await smock.fake('Dmap', {address: words.zone})
+                await ali.sendTransaction({to: fake.address, value: ethers.utils.parseEther('1')})
+                want(fake.address).to.eql(words.zone)
+
+                const rx = await send(dmap.connect(fake.wallet).set, words.name, words.meta, words.data)
+
+                const eventdata = words.meta + words.data.slice(2)
+                expectEvent(
+                    rx, undefined,
+                    [
+                        ethers.utils.hexZeroPad(words.zone, 32).toLowerCase(),
+                        words.name, words.meta, words.data
+                    ]
+                )
+
+                await check_entry(words.zone, words.name, words.meta, words.data)
+            })
+        }
+    })
+
+    describe('hashing', () => {
+        it("zone in hash", async () => {
+            const alival = '0x' + '11'.repeat(32)
+            const bobval = '0x' + 'ff'.repeat(32)
+            await send(dmap.set, b32("1"), LOCK, alival)
+            await send(dmap.connect(bob).set, b32("1"), LOCK, bobval)
+        })
+
+        it("name in hash", async () => {
+            const val0 = '0x' + '11'.repeat(32)
+            const val1 = '0x' + 'ff'.repeat(32)
+            await send(dmap.set, b32("1"), LOCK, val0)
+            await send(dmap.set, b32("2"), LOCK, val1)
+            await check_entry(ALI, b32('1'), LOCK, val0)
+            await check_entry(ALI, b32('2'), LOCK, val1)
+        })
+
+        it('name all bits in hash', async () => {
+            // make sure first and last bits of name make it into the hash
+            const fake = await smock.fake('Dmap', {address: constants.AddressZero})
+            await ali.sendTransaction({to: fake.address, value: ethers.utils.parseEther('1')})
+            want(fake.address).to.eql(constants.AddressZero)
+            const names = [
+                constants.HashZero,
+                '0x80' + '00'.repeat(31),
+                '0x' + '00'.repeat(31) + '01',
+                '0x' + 'ff'.repeat(32),
+                '0x' + 'ff'.repeat(31) + 'fe', // flip lsb
+                '0x7f' + 'ff'.repeat(31), // flip msb
+            ]
+            for (let i = 0; i < names.length; i++) {
+                await send(dmap.connect(fake.wallet).set, names[i], LOCK, b32(String(i)))
+            }
+            for (let i = 0; i < names.length; i++) {
+                await check_entry(fake.address, names[i], LOCK, b32(String(i)))
+            }
+        })
+
+        it('zone all bits in hash', async () => {
+            // make sure first and last bits of zone make it into the hash
+            const addrs = [
+                constants.AddressZero,
+                '0x80' + '00'.repeat(19),
+                '0x' + '00'.repeat(19) + '0f', // TODO hh has a problem with very low fake addresses
+                '0x' + 'ff'.repeat(20),
+                '0x' + 'ff'.repeat(19) + 'fe', // flip lsb
+                '0x7f' + 'ff'.repeat(19), // flip msb
+            ]
+            const name = b32('1')
+            for (let i = 0; i < addrs.length; i++) {
+                const fake = await smock.fake('Dmap', {address: addrs[i]})
+                await ali.sendTransaction({to: fake.address, value: ethers.utils.parseEther('1')})
+                await send(dmap.connect(fake.wallet).set, name, LOCK, b32(String(i)))
+            }
+            for (let i = 0; i < addrs.length; i++) {
+                await check_entry(addrs[i], name, LOCK, b32(String(i)))
+            }
+        })
     })
 
     describe('lock', () => {
